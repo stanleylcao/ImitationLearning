@@ -1,77 +1,154 @@
+from typing import Iterable, Union
 import numpy as np
 import gym
 from gym import spaces
+from numpy.core.fromnumeric import shape
+from numpy.linalg import norm
 
-# DIR = [np.array([0, 1]), np.array([0, -1]), np.array([1, 0]), np.array([-1, 0]), np.array([0, 0])]
 
 # DIR = [np.array([0, 1]), np.array([0, -1]), np.array([1, 0]), np.array([-1, 0])]
 
-DIR = [np.array([0, -1]), np.array([0, 1])]
+# DIR = [np.array([0, -1]), np.array([0, 1])]
 
+# TODO: Rename to GridWorld
 class TwoDimNav(gym.Env):
 	'''2D Navigation Environment'''
 	metadata = {'render.modes': ['human']}
 
-	def __init__(self, size=(10, 10), num_goals=2, goal_radius=1, goal_rew=10, max_time_step=100):
+	def __init__(self, size=(10, 10), num_goals=3, goal_radius=1, goal_rew=10, max_time_step=100):
 		super(TwoDimNav, self).__init__()
-		self.size = np.array(size, dtype=int) # length and width of grid
+		# Define actions
+		self.LEFT = np.array([0, -1])
+		self.RIGHT = np.array([0, 1])
+		self.UP = np.array([-1, 0])
+		self.DOWN = np.array([1, 0])
+		self.STAY = np.array([0, 0])
+		self.actions = [self.LEFT, self.RIGHT, self.UP, self.DOWN, self.STAY]
+
+		self.grid_size = np.array(size, dtype=int) # length and width of grid
 		self.num_goals = num_goals 
+		# ensure enough room for distinct goals
+		assert self.num_goals <= np.prod(self.grid_size)
+		
 		self.goal_radius = goal_radius # how big the goal is
 		self.goal_rew = goal_rew # goal reward
-		self.max_time_step = max_time_step
-		# self.pos_discrete_goal_states = [np.array([0, 3]), np.array([3, 0]), np.array([2, 2]), np.array([1, 3]), np.array([4, 1])]
-		# self.num_objects = len(self.pos_discrete_goal_states)
-		self.num_node_features = 1
-		# self.pos = np.random.uniform(low=0, high=self.size, size=(2,))
-		self.pos = np.random.randint(size, size=(2,))
-		# self.goal_state = np.random.uniform(low=0, high=size, size=(2,))
-		self.goal_pos = np.random.randint(size, size=(2,))
-		self.goal_state = np.concatenate((self.goal_pos, self.goal_pos))
 		self.goals_found = 0
 		self.time_step = 0
+		
+		# goals have 3 features: the x coord, the y coord, and whether the goal
+		# is completed (denoted by 0 or 1 for uncompleted and completed,
+		# respectively)
+		self.goal_features_max = np.append(self.grid_size, 2)
+		self.max_time_step = max_time_step
+		self.goals = self.create_goals()
 
-		self.action_space = spaces.Discrete(len(DIR))
-		self.observation_size_high = np.concatenate((self.size, self.size))
+		# the max value of the any observation. This is used to specify the
+		# observation space. It contains the current position and all 3-tuples
+		# denoting the features of each goal.
+		self.observation_size_high = self.grid_size
+		for _ in range(self.num_goals):
+			self.observation_size_high = np.append(self.observation_size_high, 
+											self.goal_features_max)
+
+		self.current_pos = np.random.randint(self.grid_size, size=self.grid_size.shape)
+		self.action_space = spaces.Discrete(len(self.actions))
+		# (10, 10, 10, 10, 2, 10, 10, 2, ...) TODO: remove
 		self.observation_space = spaces.Box(low=0, high=self.observation_size_high - 1,
-			shape=(4,), dtype=np.float32)
-		self.reward_range = (-1, goal_rew)
+			shape=self.observation_size_high.shape, dtype=np.float32)
+
+	def is_repeated_goal(self, generated_goal_positions: np.array, 
+		potential_goal_pos: np.array):
+		"""
+		For n generated goals, the parameter `generated_goal_positions` is a
+		(n, self.grid_size.shape[0]) numpy array containing all previously
+		generated goal positions. The parameter `potential_goal_pos` is the new
+		goal position to potentially add. This function returns True iff
+		`potential_goal_pos` is not in one of the rows of
+		`generated_goal_positions`.
+		"""
+		# Create array of booleans; each element is True iff the corresponding
+		# position coordinate matches (via broadcasting)
+		matching_elems = (generated_goal_positions == potential_goal_pos)
+		
+		# A full match would have an entire row full of True
+		row_sums = np.sum(matching_elems, axis=1)
+		full_matches = (row_sums == self.grid_size.shape[0]) # grid_size.shape = (2,) for 2D
+		num_full_matches = np.sum(full_matches)
+		return num_full_matches == 0 # True iff there are no full matches
+		
+	def create_goals(self):
+		"""
+		Creates `self.num_goals` number of distinct goals.
+		"""
+		goals = np.empty(shape=(0, self.goal_features_max.shape[0]), dtype=int)
+		for _ in range(self.num_goals):
+			goal = np.random.randint(self.grid_size, size=self.grid_size.shape)
+			while not self.is_repeated_goal(goals[:, :-1], goal):
+				goal = np.random.randint(self.grid_size, size=self.grid_size.shape)
+			goal = np.append(goal, 0).reshape(1, -1) # set goal as uncompleted by default
+			goals = np.append(goals, goal, axis=0)
+		return goals
+	
+	def mark_goals_incomplete(self, goal_indices: Iterable):
+		"""
+		Marks the goals within the iterable `goal_indices` as "incomplete", which means
+		that the third feature in the goal 3-tuple is set to 0. The iterable
+		`goal_indices` should contain the indices of the goals to reset, which is
+		0-based.
+		"""
+		completeness_index = self.goals.shape[1] - 1
+		for i in range(len(goal_indices)):
+			goal_index = goal_indices[i]
+			# Get the index of the bit representing whether the goal is
+			# completed 
+			self.goals[goal_index, completeness_index] = 0
+
+	def get_goal_pos_at_index(self, index: int):
+		# goal position is the first two numbers/features of the 3-tuple at
+		# index `index`
+		return self.goals[index, :-1]
 
 	def reset(self):
-		# self.pos = np.array([int(self.size/2), int(self.size/2)])
-		self.pos = np.random.randint(self.size, size=(2,))
-		# self.goal_state = np.random.uniform(low=0, high=self.size, size=(2,))
-		self.goal_pos = np.random.randint(self.size, size=(2,))
-		self.goal_state = np.concatenate((self.goal_pos, self.goal_pos))
+		self.current_pos = np.random.randint(self.grid_size, size=self.grid_size.shape)
+		self.goals = self.create_goals()
 		self.goals_found = 0
 		self.time_step = 0
-		state = np.array([self.pos, self.goal_pos])
-		state = state.flatten()
+		state = np.append(self.current_pos, self.goals)
 		return state
 
-	def step(self, action):
-		action = DIR[action]
-		self.pos = np.clip(self.pos + action, 0, self.size - 1)
+	def step(self, action_index):
+		action = self.actions[action_index]
+		self.current_pos = np.clip(self.current_pos + action, 0, self.grid_size - 1)
 		reward = -1
-		done = False
 		self.time_step += 1
-		if np.linalg.norm(self.pos - self.goal_pos) < self.goal_radius: 
-			reward += self.goal_rew
-			self.goals_found += 1
-			# self.goal_state = np.random.uniform(low=0, high=self.size, size=(2,))
-			# self.goal_pos = np.random.randint(self.size, size=(2,))
+		
+		# np.array of boolean values that are True iff the goal at that index
+		# has been reached
+		goals_reached = (np.linalg.norm(self.current_pos - self.goals[:, :-1], axis=1)
+							< self.goal_radius)
+		for i in range(self.num_goals):
+			if goals_reached[i] and self.goals[i, -1] == 0:
+				self.goals[i, -1] = 1 # set goal as completed
+				self.goals_found += 1 
+				reward = self.goal_rew
+		# if np.linalg.norm(self.current_pos - self.goals[:, :2]) < self.goal_radius: 
+		# 	reward += self.goal_rew
+		# 	self.goals_found += 1
 		done = (self.goals_found == self.num_goals) # or (self.time_step >= self.max_time_step)
-		state = np.array([self.pos, self.goal_pos])
-		state = state.flatten()
+		state = np.append(self.current_pos, self.goals)
 		return state, reward, done, {}
 
 	def render(self, mode='human', close=False):
-		print(f"Position: {self.pos}")
-		print(f"Goal Position: {self.goal_pos}, Radius: {self.goal_radius}, Reward: {self.goal_rew}")
+		print(f'Current position: {self.current_pos}')
+		for i in range(self.num_goals):
+			print(f'Goal {i} position: {self.goals[i, :-1]}\t Completed: {self.goals[i, -1]}')
+		# print(f"Goal Position: {self.goals}, Radius: {self.goal_radius}, Reward: {self.goal_rew}")
 
 
 
 if __name__ == '__main__':
 	env = TwoDimNav(max_time_step=10000000)
+	import pdb; pdb.set_trace()
 	time_steps = []
 	for i in range(1):
 		print("---------------------------------------------\n\n")
