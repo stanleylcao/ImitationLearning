@@ -173,6 +173,7 @@ def initialize_expert_replay_buffer(expert_demos: ExpertDemos,
     replay_buffer = np.array(demos[:num_demos], dtype=object)
     expert_replay_buffer.load_from_np(replay_buffer)
 
+# TODO: change this function to match newly update ExpertDemos constructor
 def create_expert_demos(generate_new_data: bool, expert_demos_filename: str,
     grid_size=10, num_paths=5000):
     """
