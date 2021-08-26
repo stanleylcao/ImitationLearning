@@ -25,7 +25,7 @@ TODO LIST:
 - Run Q network on expert example
 """
 
-from BC_train import ExpertDemos
+from ExpertDemos import ExpertDemos
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(device)
