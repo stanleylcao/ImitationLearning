@@ -1,13 +1,22 @@
 from environments.twodimnav import TwoDimNav
-import pdb
 import gym
 import numpy as np
-from numpy.lib.arraysetops import isin
 from tqdm import tqdm
 from heapq import heapify, heappush, heappop
-from typing import Callable
+from typing import Callable, Union
 from torch.utils.tensorboard import SummaryWriter
 from stable_baselines3.common.vec_env import VecEnv
+
+STDOUT_FILE_PATH = './logs/BC/important_stdout.txt'
+
+file = open(STDOUT_FILE_PATH, 'r+')
+file.truncate(0)
+file.close()
+
+def save_text_to_stdout_file(str: str):
+    print(str)
+    with open(STDOUT_FILE_PATH, 'a') as f:
+        f.write(str + '\n')
 
 def reconstruct_path(came_from, current) -> list:
     """
@@ -132,11 +141,24 @@ def get_optimal_episode_data(env: TwoDimNav):
     assert done == True # Verify that the environment has been solved
     return a_star_episode_reward, a_star_episode_length
 
+def get_required_model(env: TwoDimNav, *models):
+    """
+    Assuming that the i-th policy in `models` is the policy to use to get to the
+    i-th goal in `env`, this function will return the policy corresponding to
+    the first goal that is incomplete.
+    """
+    assert env.num_goals <= len(models)
+    for i in range(env.num_goals):
+        if not env.is_goal_at_index_complete(i):
+            return models[i]
+    return models[len(models) - 1] # keep returning last model if all goals complete
+
 # TODO: see if copy_of_env is needed and update function documentation as needed
 def evaluate_policy(
-    model,
     env,
+    models,
     n_eval_episodes=10,
+    eval_envs: list=None,
     deterministic=True,
     render=False,
     callback=None,
@@ -149,12 +171,15 @@ def evaluate_policy(
 
     :param env: (gym.Env or VecEnv) The gym environment. In the case of a ``VecEnv``
         this must contain only one environment.
-    :param model: (BaseAlgorithm) The RL agent you want to evaluate.
+    :param model: (BaseAlgorithm) The RL agent you want to evaluate. Or a
+        list of models constituting multiple subpolicies
     :param n_eval_episodes: (int) Number of episode to evaluate the agent
+    :param eval_envs: (list) For the caller to be able to specify the
+        evaluation environments to run on.
     :param deterministic: (bool) Whether to use deterministic or stochastic actions
     :param render: (bool) Whether to render the environment or not
     :param callback: (callable) callback function to do additional checks,
-        called after each step.
+        called after each evaluation episode.
     :param reward_threshold: (float) Minimum expected reward per episode,
         this will raise an error if the performance is not met
     :param return_episode_rewards: (bool) If True, a list of reward per episode
@@ -166,16 +191,24 @@ def evaluate_policy(
     """
     if isinstance(env, VecEnv):
         assert env.num_envs == 1, "You must pass only one environment when using this function"
-    # num_models = len(models)
-    # assert num_models > 0, 'You must pass in at least one model when using this function'
-    
-    # if num_models == 1:
-    #     model = models[0]
+    if eval_envs is not None:
+        assert len(eval_envs) == n_eval_episodes, \
+            'n_eval_episodes must match number of eval envs.'
+
+    if isinstance(models, list):
+        num_models = len(models)
+    else:
+        num_models = 1
+    assert num_models > 0, 'You must pass in at least one model when using this function'
+
     episode_rewards, episode_lengths = [], []
     a_star_episode_rewards, a_star_episode_lengths = [], []
-
-    for _ in tqdm(range(n_eval_episodes)):
-        obs = env.reset()
+    for episode_num in tqdm(range(n_eval_episodes)):
+        if eval_envs is not None:
+            env = eval_envs[episode_num]
+            obs = np.append(env.current_pos, env.goals)
+        else:
+            obs = env.reset()
         assert isinstance(env, TwoDimNav)
         # Make copy of environment so that env_copy.step will not affect the env
         # that the model operates on
@@ -188,19 +221,21 @@ def evaluate_policy(
         episode_reward = 0.0
         episode_length = 0
         while not done:
+            if num_models > 1:
+                model = get_required_model(env, *models)
+            else:
+                model = models
             action, state = model.predict(obs, state=state, deterministic=deterministic)
             obs, reward, done, _info = env.step(action)
             episode_reward += reward
-            if callback is not None:
-                callback(locals(), globals())
             episode_length += 1
             if render:
                 env.render()
-        if episode_length < a_star_episode_length:
-            import pdb; pdb.set_trace()
-
         episode_rewards.append(episode_reward)
         episode_lengths.append(episode_length)
+        if callback is not None:
+            callback(locals(), globals())
+
     mean_reward = np.mean(episode_rewards)
     std_reward = np.std(episode_rewards)
     a_star_mean_reward = np.mean(a_star_episode_rewards)
@@ -213,18 +248,33 @@ def evaluate_policy(
 
     return mean_reward, std_reward, a_star_mean_reward, a_star_std_reward
 
-def create_evaluate_policy_callback(tb_writer: SummaryWriter, eval_env: gym.Env):
+def create_bc_policy_callback(tb_writer: SummaryWriter, eval_env: gym.Env,
+    performance_difference: float=None, policy_save_path: str=None, **kwargs):
+    """
+    This function encapsulates the creation of a callback function so that
+    extra parameters can be passed into the callback function.
+    param: `tb_writer`  the `SummaryWriter` used for tensorboard logging
+    param: `performance_difference`  the difference in performance acceptable
+    between the agent and the optimal policy until the policy can be saved
+    (e.g., 0.90 means that the agent can be 90% as good as the optimal policy
+    before being saved) 
+    param: `eval_env`  the environment used for evaluation
+    """
+    # Boolean variable so that policy is only saved once. It is a dictionary so
+    # that the nested function can change the value in the dictionary
+    is_policy_saved = {'value' : False}
+
     def evaluate_policy_callback(local_var_dict: dict):
         """
-        This is the callback passed into the `bc.train()` function to evaluate it
-        until a certain average episode reward threshold.
+        This is the callback passed into the `bc.train()` function to surface
+        episode information during training.
         """
         model = local_var_dict['self'].policy
         env = eval_env
         print('Evaluating policy...')
         episode_rewards, episode_lengths, a_star_episode_rewards, a_star_episode_lengths= \
-            evaluate_policy(model, env, n_eval_episodes=100 , deterministic=False, \
-                                return_episode_rewards=True)
+            evaluate_policy(env, model, n_eval_episodes=kwargs['n_eval_episodes'] , 
+                        deterministic=False, return_episode_rewards=True)
         
         # Record agent episode performance data to tensorboard
         avg_episode_reward = np.mean(episode_rewards)
@@ -241,5 +291,14 @@ def create_evaluate_policy_callback(tb_writer: SummaryWriter, eval_env: gym.Env)
             global_step=local_var_dict['epoch_num'])
         tb_writer.add_scalar('A* Algorithm/Average Episode Length', a_star_avg_episode_length,
             global_step=local_var_dict['epoch_num'])
+        
+        # Save model if performance difference is satisfied
+        if performance_difference is not None and not is_policy_saved['value'] and \
+        avg_episode_reward >= (performance_difference * a_star_avg_episode_reward):
+            save_text_to_stdout_file(f"Agent's average episode reward within acceptable "
+            f"performance difference!\nSaving on epoch {local_var_dict['epoch_num']}...")
+            local_var_dict['self'].save_policy(policy_save_path)
+            save_text_to_stdout_file(f'Policy saved to {policy_save_path}')
+            is_policy_saved['value'] = True
 
     return evaluate_policy_callback

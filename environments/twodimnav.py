@@ -16,7 +16,7 @@ class TwoDimNav(gym.Env):
     metadata = {'render.modes': ['human']}
 
     def __init__(self, size=(10, 10), num_goals=3, objectives: Iterable[int]=None, 
-        goal_radius=1, goal_rew=10, max_time_step=200):
+        goal_radius=1, goal_rew=10, max_time_step=None):
         """
         `objectives` is a list of indices referring to the goals that need to be
         reached in order to have solved the environment
@@ -35,21 +35,23 @@ class TwoDimNav(gym.Env):
         # ensure enough room for distinct goals
         assert self.num_goals <= np.prod(self.grid_size)
         if objectives is None:
-            self.objectives = set(range(num_goals))
+            self.objectives = list(range(num_goals))
         else:
-            self.objectives = set(objectives)
+            self.objectives = list(objectives)
         
         self.goal_radius = goal_radius # how big the goal is
         self.goal_rew = goal_rew # goal reward
         self.goals_found = 0
-        self.goals_reached = set()
+        self.goals_reached = []
         self.time_step = 0
-        
+        if max_time_step is None:
+            self.max_time_step = np.prod(self.grid_size) * 2
+        else:
+            self.max_time_step = max_time_step
         # goals have 3 features: the x coord, the y coord, and whether the goal
         # is completed (denoted by 0 or 1 for uncompleted and completed,
         # respectively)
         self.goal_features_max = np.append(self.grid_size, 2)
-        self.max_time_step = max_time_step
         self.goals = self.create_goals()
 
         # the max value of the any observation. This is used to specify the
@@ -127,12 +129,15 @@ class TwoDimNav(gym.Env):
         0-based.
         """
         self.time_step = 0
-        completeness_index = self.goals.shape[1] - 1
+        completeness_index = self.goals.shape[1] - 1 # TODO: change to -1
         for i in range(len(goal_indices)):
             goal_index = goal_indices[i]
             # Get the index of the bit representing whether the goal is
             # completed 
             self.goals[goal_index, completeness_index] = 0
+
+    def is_goal_at_index_complete(self, index: int):
+        return self.goals[index, -1]
 
     def get_goal_pos_at_index(self, index: int):
         # goal position is the first two numbers/features of the 3-tuple at
@@ -174,13 +179,19 @@ class TwoDimNav(gym.Env):
         # has been reached
         goals_currently_at = (np.linalg.norm(self.current_pos - self.goals[:, :-1], axis=1)
                             < self.goal_radius)
-        for i in range(self.num_goals):
+        
+        for i in self.objectives: # multiple goals could be reached with a larger radius
+            # Following logic only counts the reward and completes the goal if
+            # the goal was completed in the order seen in `self.objectives`.
             if goals_currently_at[i] and self.goals[i, -1] == 0:
                 self.goals[i, -1] = 1 # set goal as completed
                 self.goals_found += 1 
-                self.goals_reached.add(i)
+                self.goals_reached.append(i)
                 reward = self.goal_rew
-        done = self.objectives.issubset(self.goals_reached) \
+            elif i not in self.goals_reached:
+                break
+
+        done = bool(self.objectives == self.goals_reached) \
             or (self.time_step >= self.max_time_step)
         state = np.append(self.current_pos, self.goals)
         return state, reward, done, {}
@@ -194,7 +205,7 @@ class TwoDimNav(gym.Env):
 
 
 if __name__ == '__main__':
-    env = TwoDimNav(max_time_step=10000000)
+    env = TwoDimNav()
     import pdb; pdb.set_trace()
     time_steps = []
     for i in range(1):
