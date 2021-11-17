@@ -1,3 +1,3 @@
 # ImitationLearning
 
-For the final results of this research, please see file in this repo titled: `CURIS_Research_Poster_FINAL.pdf`
+For the final results of this research, please see file in this repo titled: `CURIS research poster_FINAL.pdf`
